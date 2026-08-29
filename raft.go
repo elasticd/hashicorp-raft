@@ -2217,7 +2217,10 @@ func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 func (r *Raft) setLatestConfiguration(c Configuration, i uint64) {
 	r.configurations.latest = c
 	r.configurations.latestIndex = i
-	r.latestConfiguration.Store(c.Clone())
+	r.latestConfiguration.Store(configurations{
+		latest:      c.Clone(),
+		latestIndex: i,
+	})
 }
 
 // setCommittedConfiguration stores the committed configuration.
@@ -2229,13 +2232,13 @@ func (r *Raft) setCommittedConfiguration(c Configuration, i uint64) {
 // getLatestConfiguration reads the configuration from a copy of the main
 // configuration, which means it can be accessed independently from the main
 // loop.
-func (r *Raft) getLatestConfiguration() Configuration {
+func (r *Raft) getLatestConfiguration() (Configuration, uint64) {
 	// this switch catches the case where this is called without having set
 	// a configuration previously.
 	switch c := r.latestConfiguration.Load().(type) {
-	case Configuration:
-		return c
+	case configurations:
+		return c.latest, c.latestIndex
 	default:
-		return Configuration{}
+		return Configuration{}, 0
 	}
 }

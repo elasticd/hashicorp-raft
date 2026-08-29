@@ -82,6 +82,13 @@ func TestRaft_LiveBootstrap(t *testing.T) {
 	if err := boot.Error(); err != nil {
 		t.Fatalf("bootstrap err: %v", err)
 	}
+	bootstrapConfiguration := c.rafts[0].GetConfiguration()
+	if err := bootstrapConfiguration.Error(); err != nil {
+		t.Fatalf("get bootstrap configuration: %v", err)
+	}
+	if bootstrapConfiguration.Index() != 1 {
+		t.Fatalf("bootstrap configuration index = %d, want 1", bootstrapConfiguration.Index())
+	}
 
 	// Should be one leader.
 	c.Followers()
@@ -962,6 +969,10 @@ func TestRaft_SnapshotRestore(t *testing.T) {
 
 	// Commit a lot of things
 	leader := c.Leader()
+	beforeConfiguration := leader.GetConfiguration()
+	if err := beforeConfiguration.Error(); err != nil {
+		t.Fatalf("get configuration before snapshot: %v", err)
+	}
 	var future Future
 	for i := 0; i < 100; i++ {
 		future = leader.Apply([]byte(fmt.Sprintf("test%d", i)), 0)
@@ -1010,6 +1021,20 @@ func TestRaft_SnapshotRestore(t *testing.T) {
 	// We should have restored from the snapshot!
 	if last := r.getLastApplied(); last != snap.Index {
 		t.Fatalf("bad last index: %d, expecting %d", last, snap.Index)
+	}
+	afterConfiguration := r.GetConfiguration()
+	if err := afterConfiguration.Error(); err != nil {
+		t.Fatalf("get configuration after restart: %v", err)
+	}
+	if afterConfiguration.Index() != beforeConfiguration.Index() ||
+		!reflect.DeepEqual(afterConfiguration.Configuration(), beforeConfiguration.Configuration()) {
+		t.Fatalf(
+			"restored configuration = (%d, %+v), want (%d, %+v)",
+			afterConfiguration.Index(),
+			afterConfiguration.Configuration(),
+			beforeConfiguration.Index(),
+			beforeConfiguration.Configuration(),
+		)
 	}
 }
 
@@ -2692,6 +2717,32 @@ func TestRaft_GetConfigurationNoBootstrap(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := cfgf.Configuration()
+	if cfgf.Index() == 0 {
+		t.Fatal("running configuration has zero index")
+	}
+	changed := leader.AddNonvoter(
+		ServerID("nonvoter"),
+		ServerAddress("nonvoter"),
+		cfgf.Index(),
+		c.conf.CommitTimeout,
+	)
+	if err := changed.Error(); err != nil {
+		t.Fatalf("add nonvoter: %v", err)
+	}
+	changedConfiguration := leader.GetConfiguration()
+	if err := changedConfiguration.Error(); err != nil {
+		t.Fatalf("get changed configuration: %v", err)
+	}
+	if changedConfiguration.Index() != changed.Index() ||
+		changedConfiguration.Index() <= cfgf.Index() {
+		t.Fatalf(
+			"changed configuration index = %d, future = %d, previous = %d",
+			changedConfiguration.Index(),
+			changed.Index(),
+			cfgf.Index(),
+		)
+	}
+	expected = changedConfiguration.Configuration()
 
 	// Obtain the same configuration via GetConfig
 	logs := c.stores[0]

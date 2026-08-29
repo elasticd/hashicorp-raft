@@ -897,7 +897,11 @@ func (r *Raft) VerifyLeader() Future {
 func (r *Raft) GetConfiguration() ConfigurationFuture {
 	configReq := &configurationsFuture{}
 	configReq.init()
-	configReq.configurations = configurations{latest: r.getLatestConfiguration()}
+	configuration, index := r.getLatestConfiguration()
+	configReq.configurations = configurations{
+		latest:      configuration,
+		latestIndex: index,
+	}
 	configReq.respond(nil)
 	return configReq
 }
