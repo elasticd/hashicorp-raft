@@ -1,4 +1,4 @@
-module github.com/hashicorp/raft
+module github.com/elasticd/hashicorp-raft
 
 go 1.20
 
