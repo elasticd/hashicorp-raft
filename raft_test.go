@@ -1549,11 +1549,11 @@ func snapshotAndRestore(t *testing.T, offset uint64, monotonicLogStore bool, res
 		t.Fatalf("Index was not updated correctly: %d vs. %d", lastIndex, expected)
 	}
 
-	// Ensure raft logs are removed for monotonic log stores but remain
-	// untouched for non-monotic (BoltDB) logstores.
-	// When first index = 1, then logs have remained untouched.
-	// When first index is set to the next commit index / last index, then
-	// it means logs have been removed.
+	// Ensure followers remove logs preceding the restored snapshot. They cannot
+	// retain a log without an entry matching the snapshot boundary; Figure 13
+	// rule 7 requires discarding that complete log regardless of whether the
+	// store permits sparse indexes. The node performing a user restore retains
+	// its non-monotonic log under the separate local-restore contract.
 	raftNodes := make([]*Raft, 0, numPeers+1)
 	raftNodes = append(raftNodes, leader)
 	raftNodes = append(raftNodes, c.Followers()...)
@@ -1562,10 +1562,10 @@ func snapshotAndRestore(t *testing.T, offset uint64, monotonicLogStore bool, res
 		require.NoError(t, err)
 		lastLogIndex, err := raftNode.logs.LastIndex()
 		require.NoError(t, err)
-		if monotonicLogStore {
-			require.Equal(t, expected, firstLogIndex)
-		} else {
+		if raftNode == leader && !monotonicLogStore {
 			require.Equal(t, uint64(1), firstLogIndex)
+		} else {
+			require.Equal(t, expected, firstLogIndex)
 		}
 		require.Equal(t, expected, lastLogIndex)
 	}

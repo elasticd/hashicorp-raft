@@ -1909,6 +1909,15 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}
 	r.logger.Info("copied to local snapshot", "bytes", n)
 
+	// Discard a log that cannot join the durable snapshot boundary before
+	// replacing the FSM. A cleanup failure leaves the prior FSM intact and the
+	// finalized snapshot available for a retry or startup recovery.
+	if err := r.discardSnapshotConflictingLogs(req.LastLogIndex, req.LastLogTerm); err != nil {
+		r.logger.Error("failed to reconcile logs for snapshot", "error", err)
+		rpcErr = fmt.Errorf("failed to reconcile logs for snapshot: %w", err)
+		return
+	}
+
 	// Restore snapshot
 	future := &restoreFuture{ID: sink.ID()}
 	future.ShutdownCh = r.shutdownCh
@@ -1922,9 +1931,10 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 
 	// Wait for the restore to happen
 	if err := future.Error(); err != nil {
-		r.logger.Error("failed to restore snapshot", "error", err)
-		rpcErr = err
-		return
+		// FSM.Restore may discard or partially replace its prior state before
+		// returning an error. Continuing would expose an indeterminate FSM, so use
+		// the same fail-stop behavior as a failed user-triggered restore.
+		panic(fmt.Errorf("failed to restore snapshot: %v", err))
 	}
 
 	// Update the lastApplied so we don't replay old logs
@@ -1938,10 +1948,13 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
 
 	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
-	// logs. In both cases, log any errors and continue.
+	// logs. A successful full reset must also clear the cached durable-log tail;
+	// getLastEntry will then use the installed snapshot boundary.
 	if mlogs, ok := r.logs.(MonotonicLogStore); ok && mlogs.IsMonotonic() {
 		if err := r.removeOldLogs(); err != nil {
 			r.logger.Error("failed to reset logs", "error", err)
+		} else {
+			r.setLastLog(0, 0)
 		}
 	} else if err := r.compactLogs(req.LastLogIndex); err != nil {
 		r.logger.Error("failed to compact logs", "error", err)

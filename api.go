@@ -594,9 +594,11 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		return nil, err
 	}
 
-	// Scan through the log for any configuration change entries.
+	// Snapshot recovery can reconcile the durable log. Recompute the scan bound
+	// instead of using the value captured before restore.
 	snapshotIndex, _ := r.getLastSnapshot()
-	for index := snapshotIndex + 1; index <= lastLog.Index; index++ {
+	lastLogIndex, _ := r.getLastLog()
+	for index := snapshotIndex + 1; index <= lastLogIndex; index++ {
 		var entry Log
 		if err := r.logs.GetLog(index, &entry); err != nil {
 			r.logger.Error("failed to get log", "index", index, "error", err)
@@ -639,6 +641,9 @@ func (r *Raft) restoreSnapshot() error {
 	for _, snapshot := range snapshots {
 		if success := r.tryRestoreSingleSnapshot(snapshot); !success {
 			continue
+		}
+		if err := r.discardSnapshotConflictingLogs(snapshot.Index, snapshot.Term); err != nil {
+			return fmt.Errorf("failed to reconcile logs with snapshot %s: %w", snapshot.ID, err)
 		}
 
 		// Update the lastApplied so we don't replay old logs

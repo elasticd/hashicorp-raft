@@ -4,6 +4,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -275,4 +276,62 @@ func (r *Raft) removeOldLogs() error {
 	// it will take the lesser of lastLogIdx and snapIdx to figure out
 	// the end for which to apply trailingLogs.
 	return r.compactLogsWithTrailing(lastLogIdx, lastLogIdx, 0)
+}
+
+// discardSnapshotConflictingLogs applies Figure 13 rule 7 from the Raft paper
+// before a remote snapshot replaces the FSM. A matching boundary retains its
+// suffix; a missing or conflicting boundary discards the complete log. The
+// cached log tail changes only after durable deletion succeeds.
+func (r *Raft) discardSnapshotConflictingLogs(snapshotIndex, snapshotTerm uint64) error {
+	var boundary Log
+	boundaryErr := r.logs.GetLog(snapshotIndex, &boundary)
+	if boundaryErr == nil && boundary.Term == snapshotTerm {
+		return nil
+	}
+	if boundaryErr != nil && !errors.Is(boundaryErr, ErrLogNotFound) {
+		return fmt.Errorf("read snapshot boundary log %d: %w", snapshotIndex, boundaryErr)
+	}
+
+	firstIndex, err := r.logs.FirstIndex()
+	if err != nil {
+		return fmt.Errorf("get first log index: %w", err)
+	}
+	lastIndex, err := r.logs.LastIndex()
+	if err != nil {
+		return fmt.Errorf("get last log index: %w", err)
+	}
+	if firstIndex == 0 && lastIndex == 0 {
+		r.setLastLog(0, 0)
+		return nil
+	}
+	if firstIndex == 0 || lastIndex == 0 || firstIndex > lastIndex {
+		return fmt.Errorf(
+			"invalid log index range before snapshot: first=%d last=%d",
+			firstIndex,
+			lastIndex,
+		)
+	}
+	if err := r.logs.DeleteRange(firstIndex, lastIndex); err != nil {
+		return fmt.Errorf("discard divergent log range %d..%d: %w", firstIndex, lastIndex, err)
+	}
+
+	r.setLastLog(0, 0)
+	if boundaryErr == nil {
+		r.logger.Warn(
+			"discarded log conflicting with installed snapshot",
+			"first-index", firstIndex,
+			"last-index", lastIndex,
+			"boundary-index", snapshotIndex,
+			"local-term", boundary.Term,
+			"snapshot-term", snapshotTerm,
+		)
+	} else {
+		r.logger.Warn(
+			"discarded log missing installed snapshot boundary",
+			"first-index", firstIndex,
+			"last-index", lastIndex,
+			"boundary-index", snapshotIndex,
+		)
+	}
+	return nil
 }
