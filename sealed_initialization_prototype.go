@@ -85,7 +85,7 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 		proof.tailIndex <= proof.snapshot.Index || proof.tailTerm < proof.snapshot.Term {
 		return nil, errSealedInitialization
 	}
-	if err := checkConfiguration(proof.snapshot.Configuration); err != nil {
+	if err := checkSealedConfiguration(proof.snapshot.Configuration); err != nil {
 		return nil, errors.Join(errSealedInitialization, err)
 	}
 	proof.snapshot.Configuration = proof.snapshot.Configuration.Clone()
@@ -109,6 +109,9 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(errSealedInitialization, err)
+	}
 	observation := sealedObservation{
 		CommitIndex: r.CommitIndex(), AppliedIndex: r.AppliedIndex(),
 		SnapshotIndex: proof.snapshot.Index, LastLogIndex: r.LastIndex(),
@@ -124,6 +127,17 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 		return nil, err
 	}
 	return &sealedInitialization{raft: r, app: app, observation: observation}, nil
+}
+
+func checkSealedConfiguration(configuration Configuration) error {
+	for _, server := range configuration.Servers {
+		switch server.Suffrage {
+		case Voter, Nonvoter, Staging:
+		default:
+			return fmt.Errorf("unknown server suffrage: %d", server.Suffrage)
+		}
+	}
+	return checkConfiguration(configuration)
 }
 
 type sealedElection struct {
@@ -252,7 +266,11 @@ func replaySealedHistory(ctx context.Context, app sealedApplication, proof seale
 		switch entry.Type {
 		case LogCommand:
 			toApply := cloneSealedLog(entry)
-			if err := confirmApply(cloneSealedLog(entry), app.Apply(&toApply)); err != nil {
+			result := app.Apply(&toApply)
+			if err := ctx.Err(); err != nil {
+				return nil, errors.Join(errSealedInitialization, err)
+			}
+			if err := confirmApply(cloneSealedLog(entry), result); err != nil {
 				return nil, errors.Join(errSealedInitialization, err)
 			}
 		case LogConfiguration:
@@ -260,11 +278,14 @@ func replaySealedHistory(ctx context.Context, app sealedApplication, proof seale
 			if err := decodeMsgPack(entry.Data, &next); err != nil {
 				return nil, errors.Join(errSealedInitialization, err)
 			}
-			if err := checkConfiguration(next); err != nil || !bytes.Equal(entry.Data, EncodeConfiguration(next)) {
+			if err := checkSealedConfiguration(next); err != nil || !bytes.Equal(entry.Data, EncodeConfiguration(next)) {
 				return nil, errors.Join(errSealedInitialization, err)
 			}
 			config, configIndex = next, entry.Index
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(errSealedInitialization, err)
 	}
 	last := history.entries[len(history.entries)-1]
 	r := &Raft{fsm: appAdapter{app}}

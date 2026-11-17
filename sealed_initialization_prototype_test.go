@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,6 +22,93 @@ type sealedFixture struct {
 	last   uint64
 	logs   map[uint64]Log
 	stable map[string][]byte
+}
+
+type sealedConfigurationTestFSM struct{ appAdapter }
+
+func (sealedConfigurationTestFSM) StoreConfiguration(uint64, Configuration) {}
+
+type sealedBatchTestFSM struct{ appAdapter }
+
+func (sealedBatchTestFSM) ApplyBatch([]*Log) []interface{} { return nil }
+
+func TestSealedLocalRaftV1RefusesUnsupportedFSMBeforeRestore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	source, proof := newSealedFixture()
+	checkpoint := SealedCheckpointV1{Snapshot: proof.snapshot, BodySHA256: proof.bodyDigest,
+		TailIndex: proof.tailIndex, TailTerm: proof.tailTerm, TailSHA256: proof.tailDigest}
+	for _, makeFSM := range []func(appAdapter) FSM{
+		func(app appAdapter) FSM { return sealedConfigurationTestFSM{app} },
+		func(app appAdapter) FSM { return sealedBatchTestFSM{app} },
+	} {
+		app := &sealedTestApplication{}
+		result, err := NewSealedLocalRaftV1(ctx, checkpoint, source, source, source, makeFSM(appAdapter{app}),
+			confirmSealedFixtureApply, func(facts SealedReadbackV1) error {
+				return confirmSealedFixtureState(app, facts)
+			})
+		if result != nil || !errors.Is(err, errSealedInitialization) || app.data != nil {
+			t.Fatalf("unsupported FSM reached restore: %v", err)
+		}
+	}
+}
+
+func TestSealedRaftInitializationSkipsConfirmationAfterCancellation(t *testing.T) {
+	for _, stage := range []string{"apply", "confirmation"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			source, proof := newSealedFixture()
+			source.last = proof.tailIndex // no next entry at which to check cancellation
+			app := &sealedTestApplication{}
+			if stage == "apply" {
+				app.after = cancel
+			}
+			applyCalls, stateCalls := 0, 0
+			result, err := initializeSealedRaft(ctx, proof, source, source, source, app,
+				func(Log, interface{}) error {
+					applyCalls++
+					if stage == "confirmation" {
+						cancel()
+					}
+					return nil
+				},
+				func(sealedObservation) error { stateCalls++; return nil })
+			wantApply := 0
+			if stage == "confirmation" {
+				wantApply = 1
+			}
+			if result != nil || !errors.Is(err, context.Canceled) || applyCalls != wantApply || stateCalls != 0 {
+				t.Fatalf("result=%v err=%v apply confirmations=%d state confirmations=%d", result, err, applyCalls, stateCalls)
+			}
+		})
+	}
+}
+
+func TestSealedRaftInitializationRefusesUnknownSuffrage(t *testing.T) {
+	for _, stage := range []string{"snapshot", "log"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			source, proof := newSealedFixture()
+			unknown := Server{ID: "b", Address: "other", Suffrage: ServerSuffrage(30)}
+			if stage == "snapshot" {
+				source.meta.Configuration.Servers = append(source.meta.Configuration.Servers, unknown)
+				proof.snapshot.Configuration = source.meta.Configuration.Clone()
+			} else {
+				entry := source.logs[9]
+				config := DecodeConfiguration(entry.Data)
+				config.Servers = append(config.Servers, unknown)
+				entry.Data = EncodeConfiguration(config)
+				source.logs[9] = entry
+			}
+			result, err := initializeSealedRaft(ctx, proof, source, source, source, &sealedTestApplication{},
+				confirmSealedFixtureApply, func(sealedObservation) error { return nil })
+			if result != nil || !errors.Is(err, errSealedInitialization) || !strings.Contains(err.Error(), "unknown server suffrage") {
+				t.Fatalf("unknown server suffrage not rejected: %v", err)
+			}
+		})
+	}
 }
 
 func (s *sealedFixture) List() ([]*SnapshotMeta, error) { return []*SnapshotMeta{&s.meta}, nil }

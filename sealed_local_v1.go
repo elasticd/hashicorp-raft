@@ -24,10 +24,13 @@ type SealedReadbackV1 = sealedObservation
 // SealedLogReaderV1 reads retained Raft log entries without mutating them.
 type SealedLogReaderV1 = sealedLogReader
 
-// SealedStableReaderV1 reads retained election records without writing them.
+// SealedStableReaderV1 reads the raw persisted election records. The term
+// records must be eight-byte big-endian values. A missing record must return
+// the store's "not found" error; an empty record is malformed.
 type SealedStableReaderV1 = sealedStableReader
 
 // SealedSnapshotReaderV1 opens the already-selected snapshot and metadata.
+// List must expose exactly that snapshot, not the entire store inventory.
 type SealedSnapshotReaderV1 = sealedSnapshotReader
 
 // SealedLocalRaftV1 retains the locally initialized node and application.
@@ -44,10 +47,21 @@ type SealedLocalRaftV1 struct {
 // and own a fresh, private FSM. The FSM may be partially initialized
 // on error; it must not be reused or published. The function receives no
 // transport, mutates no durable record and does not truncate a suffix.
+// Only ordinary single-entry FSMs are supported: batching and configuration
+// store FSMs are refused before restore. The FSM and callbacks must not
+// mutate the retained sources or publish authority during initialization.
+// The context is checked between synchronous calls; it cannot interrupt a
+// blocked store, FSM, or confirmation callback.
 func NewSealedLocalRaftV1(ctx context.Context, checkpoint SealedCheckpointV1,
 	logs SealedLogReaderV1, stable SealedStableReaderV1, snapshots SealedSnapshotReaderV1, app FSM,
 	confirmApply func(Log, interface{}) error, confirmState func(SealedReadbackV1) error,
 ) (*SealedLocalRaftV1, error) {
+	if _, ok := app.(BatchingFSM); ok {
+		return nil, errSealedInitialization
+	}
+	if _, ok := app.(ConfigurationStore); ok {
+		return nil, errSealedInitialization
+	}
 	proof := sealedProof{
 		snapshot: checkpoint.Snapshot, bodyDigest: checkpoint.BodySHA256,
 		tailIndex: checkpoint.TailIndex, tailTerm: checkpoint.TailTerm, tailDigest: checkpoint.TailSHA256,
