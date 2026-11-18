@@ -463,13 +463,50 @@ func TestSealedRuntimeWorkersV1BeginCloseSignalsBeforePhysicalClose(t *testing.T
 		t.Fatal("beginClose returned before signalling runtime shutdown")
 	}
 	select {
-	case <-fixture.source.closeEntered:
-		t.Fatal("beginClose waited for physical Close")
+	case <-owner.closeDone:
+		t.Fatal("beginClose forgot blocked physical Close custody")
 	default:
 	}
 	proceedOnce.Do(func() { close(physicalProceed) })
 	if err := sealedWorkersCloseV1(t, owner); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSealedRuntimeWorkersV1PoisonDuringParkJoinsBothWatchers(t *testing.T) {
+	fixture := newSealedWorkersFixtureV1(t)
+	original := fixture.local.revalidate
+	fixture.local.revalidate = func() error {
+		if err := original(); err != nil {
+			return err
+		}
+		fixture.gate.failV1()
+		return nil
+	}
+	owner := fixture.park(t)
+	select {
+	case <-owner.closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("poison during park did not complete retained cleanup")
+	}
+	for name, done := range map[string]<-chan struct{}{
+		"startup": owner.startupDone,
+		"gate":    owner.gateWatchDone,
+	} {
+		if done == nil {
+			t.Fatalf("%s watcher join channel was not initialized", name)
+		}
+		select {
+		case <-done:
+		default:
+			t.Fatalf("cleanup completed before %s watcher joined", name)
+		}
+	}
+	if fixture.runtime.State() != Shutdown || fixture.source.closes.Load() != 1 {
+		t.Fatalf("poison retained runtime=%v closes=%d", fixture.runtime.State(), fixture.source.closes.Load())
+	}
+	if runtime, err := owner.releaseV1(); runtime != nil || !errors.Is(err, errSealedRuntimeWorkersV1) {
+		t.Fatalf("poisoned park reopened: %p %v", runtime, err)
 	}
 }
 

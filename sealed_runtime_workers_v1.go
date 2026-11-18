@@ -114,6 +114,10 @@ func parkSealedRuntimeWorkersIntoV1(owner *sealedRuntimeWorkersV1,
 	// This watcher is registered only after every ordinary runtime worker has
 	// joined its wait group. A poisoned local gate owns the same runtime
 	// lifetime whether it is observed before or after release.
+	// Publish every watcher join channel before either watcher can initiate
+	// cleanup. The gate may already have failed during proof revalidation.
+	owner.startupStop = make(chan struct{})
+	owner.startupDone = make(chan struct{})
 	owner.mu.Lock()
 	owner.gateWatchDone = make(chan struct{})
 	gateWatchDone := owner.gateWatchDone
@@ -122,15 +126,13 @@ func parkSealedRuntimeWorkersIntoV1(owner *sealedRuntimeWorkersV1,
 		defer close(gateWatchDone)
 		<-owner.transport.stop
 		if owner.transport.failedV1() {
-			// Do not self-join: the cleanup goroutine joins this watcher after
-			// this asynchronous close initiation has returned.
-			go owner.beginCloseV1()
+			// beginClose only launches the joining goroutine, so this watcher
+			// returns before that goroutine waits for gateWatchDone.
+			owner.beginCloseV1()
 		}
 	}()
 	// Register cancellation only after all wait-group additions. After the
 	// successful handoff it must not silently stop the serving lifetime.
-	owner.startupStop = make(chan struct{})
-	owner.startupDone = make(chan struct{})
 	go func() {
 		defer close(owner.startupDone)
 		select {
