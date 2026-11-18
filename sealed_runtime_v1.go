@@ -15,9 +15,10 @@ type SealedRuntimeV1 struct {
 }
 
 // NewSealedRuntimeV1 prepares one sealed, parked Raft lifetime from the
-// original constructor inputs. A non-nil partial lifetime is always returned,
-// including when construction returns an error, so its caller retains cleanup
-// custody. It does not authenticate physical publication, establish a quorum,
+// original constructor inputs. Once transport custody is acquired, a non-nil
+// partial lifetime is returned even on error; pre-acquisition refusal returns
+// nil. The caller must retain the partial lifetime for cleanup. It does not
+// authenticate physical publication, establish a quorum,
 // establish health or resource readiness, or authorize an elasticd production
 // caller.
 func NewSealedRuntimeV1(
@@ -48,6 +49,8 @@ func NewSealedRuntimeV1(
 // deferred authenticated transport and guarded FSM/snapshot owner remain outer
 // responsibilities. A returned Raft and its Shutdown future never supersede
 // this wrapper's physical transport cleanup and actual worker join.
+// An error may follow worker start: callers must still close this same
+// lifetime and must not retry its release.
 func (runtime *SealedRuntimeV1) ReleaseV1() (*Raft, error) {
 	if runtime == nil || runtime.owner == nil {
 		return nil, errSealedRuntimeWorkersV1
