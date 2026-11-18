@@ -5,9 +5,10 @@
 - The v1 detached host-gate receipt recorded Go 1.26.11 root-module normal
   and race tests plus vet, and the focused Go 1.20.14 sealed-constructor
   compatibility check. Native qualification remains held.
-- Review a public handoff interface and its actual elasticd owner composition.
-  The current private worker/delivery prototype is not authenticated physical
-  publication, a dependency adoption, or a serving-readiness result.
+- Real elasticd reducer integration, guarded successor snapshot ownership,
+  actual product composition, and native serving remain unfinished. The public
+  sealed runtime wrapper is not authenticated physical publication, dependency
+  adoption, a serving-readiness result, or permission to activate elasticd.
 - Preserve the original anchor and suffix until the actual snapshot owner
   proves a durable successor; do not bypass the existing guarded Snapshot path.
 - Prove restart with the real elasticd reducer before any separately authorized
