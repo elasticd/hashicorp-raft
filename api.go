@@ -79,6 +79,10 @@ var (
 type Raft struct {
 	raftState
 
+	// localApplyFenceV1 is immutable after construction. Enabling it also
+	// disables the transport heartbeat fast path before workers start.
+	localApplyFenceV1 bool
+
 	// protocolVersion is used to inter-operate with Raft servers running
 	// different versions of the library. See comments in config.go for more
 	// details.
@@ -581,6 +585,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	}
 
 	r.conf.Store(*conf)
+	r.localApplyFenceV1 = conf.EnableLocalApplyFenceV1
 
 	// Initialize as a follower.
 	r.setState(Follower)
@@ -615,7 +620,11 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	// Setup a heartbeat fast-path to avoid head-of-line
 	// blocking where possible. It MUST be safe for this
 	// to be called concurrently with a blocking RPC.
-	trans.SetHeartbeatHandler(r.processHeartbeat)
+	if r.localApplyFenceV1 {
+		trans.SetHeartbeatHandler(nil)
+	} else {
+		trans.SetHeartbeatHandler(r.processHeartbeat)
+	}
 
 	if conf.skipStartup {
 		return r, nil

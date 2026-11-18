@@ -1248,24 +1248,39 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	term := r.getCurrentTerm()
 	lastIndex := r.getLastIndex()
 
-	n := len(applyLogs)
-	logs := make([]*Log, n)
-	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
+	logs := make([]*Log, 0, len(applyLogs))
+	accepted := applyLogs[:0]
 
-	for idx, applyLog := range applyLogs {
+	for _, applyLog := range applyLogs {
+		// This is the admission point for this individual command. With
+		// loop-only heartbeats, term and configuration cannot move between
+		// this check and its index assignment. Later cancellation or shutdown
+		// does not establish that the accepted write was absent.
+		if fence := applyLog.localFence; fence != nil {
+			applyLog.localFence = nil
+			if !r.matchesLocalApplyFenceV1(fence) {
+				applyLog.respond(ErrLocalApplyFenceV1)
+				continue
+			}
+		}
 		applyLog.dispatch = now
 		lastIndex++
 		applyLog.log.Index = lastIndex
 		applyLog.log.Term = term
 		applyLog.log.AppendedAt = now
-		logs[idx] = &applyLog.log
+		logs = append(logs, &applyLog.log)
+		accepted = append(accepted, applyLog)
 		r.leaderState.inflight.PushBack(applyLog)
+	}
+	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(len(logs)))
+	if len(logs) == 0 {
+		return
 	}
 
 	// Write the log entry locally
 	if err := r.logs.StoreLogs(logs); err != nil {
 		r.logger.Error("failed to commit logs", "error", err)
-		for _, applyLog := range applyLogs {
+		for _, applyLog := range accepted {
 			applyLog.respond(err)
 		}
 		r.setState(Follower)

@@ -151,9 +151,10 @@ type bootstrapFuture struct {
 // the log is considered committed.
 type logFuture struct {
 	deferError
-	log      Log
-	response interface{}
-	dispatch time.Time
+	log        Log
+	response   interface{}
+	dispatch   time.Time
+	localFence *localApplyFenceV1
 }
 
 func (l *logFuture) Response() interface{} {
