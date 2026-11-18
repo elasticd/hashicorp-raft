@@ -497,11 +497,11 @@ func HasExistingState(logs LogStore, stable StableStore, snaps SnapshotStore) (b
 	return false, nil
 }
 
-// NewRaft is used to construct a new Raft node. It takes a configuration, as well
-// as implementations of various interfaces that are required. If we have any
-// old state, such as snapshots, logs, peers, etc, all those will be restored
-// when creating the Raft node.
-func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps SnapshotStore, trans Transport) (*Raft, error) {
+// newRaftRuntimeV1 assembles the retained stores, application, transport and
+// worker channels without restoring an application, persisting state, attaching
+// a heartbeat handler or starting workers. The ordinary and sealed constructors
+// must own those separate transitions themselves.
+func newRaftRuntimeV1(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps SnapshotStore, trans Transport) (*Raft, error) {
 	// Validate the configuration.
 	if err := ValidateConfig(conf); err != nil {
 		return nil, err
@@ -591,8 +591,22 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	r.setState(Follower)
 
 	// Restore the current term and the last log.
-	r.setCurrentTerm(currentTerm)
+	r.raftState.setCurrentTerm(currentTerm)
 	r.setLastLog(lastLog.Index, lastLog.Term)
+	return r, nil
+}
+
+// NewRaft is used to construct a new Raft node. It takes a configuration, as well
+// as implementations of various interfaces that are required. If we have any
+// old state, such as snapshots, logs, peers, etc, all those will be restored
+// when creating the Raft node.
+func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps SnapshotStore, trans Transport) (*Raft, error) {
+	r, err := newRaftRuntimeV1(conf, fsm, logs, stable, snaps, trans)
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the ordinary constructor's existing durable term initialization.
+	r.setCurrentTerm(r.raftState.getCurrentTerm())
 
 	// Attempt to restore a snapshot if there are any.
 	if err := r.restoreSnapshot(); err != nil {

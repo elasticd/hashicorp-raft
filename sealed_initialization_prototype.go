@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sync"
 )
 
 // The initialization kernel receives no start capability, transport,
@@ -66,16 +67,45 @@ type sealedInitialization struct {
 	raft        *Raft
 	app         sealedApplication
 	observation sealedObservation
+	startup     context.Context
+	revalidate  func() error
+	workerMu    sync.Mutex
+	workerClaim bool
 }
 
 func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLogReader,
 	stable sealedStableReader, snapshots sealedSnapshotReader, app sealedApplication,
 	confirmApply func(Log, interface{}) error, confirmState func(sealedObservation) error,
 ) (*sealedInitialization, error) {
-	if ctx == nil || ctx.Err() != nil || logs == nil || stable == nil || snapshots == nil ||
-		app == nil || confirmApply == nil || confirmState == nil {
+	if app == nil {
 		return nil, errSealedInitialization
 	}
+	sealed, err := initializeSealedRaftIntoV1(ctx, &Raft{fsm: appAdapter{app}}, proof,
+		logs, stable, snapshots, confirmApply, confirmState)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the original V1 application's retained identity, not its adapter.
+	sealed.app = app
+	// The legacy readback-only result must not retain a startup capability or
+	// extend custody of the captured history through a new revalidation closure.
+	sealed.startup = nil
+	sealed.revalidate = nil
+	return sealed, nil
+}
+
+// initializeSealedRaftIntoV1 applies the original proof to the same private
+// runtime assembled by its owner. It never rebuilds that runtime or starts its
+// workers. The owner must retain the original application and closed transport.
+func initializeSealedRaftIntoV1(ctx context.Context, runtime *Raft, proof sealedProof,
+	logs sealedLogReader, stable sealedStableReader, snapshots sealedSnapshotReader,
+	confirmApply func(Log, interface{}) error, confirmState func(sealedObservation) error,
+) (*sealedInitialization, error) {
+	if ctx == nil || ctx.Err() != nil || logs == nil || stable == nil || snapshots == nil ||
+		runtime == nil || runtime.fsm == nil || confirmApply == nil || confirmState == nil {
+		return nil, errSealedInitialization
+	}
+	app := runtime.fsm
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, errSealedInitialization
 	}
@@ -102,22 +132,17 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 	if err != nil || ctx.Err() != nil {
 		return nil, errors.Join(errSealedInitialization, err, ctx.Err())
 	}
-	if err := app.Restore(io.NopCloser(bytes.NewReader(body))); err != nil {
-		return nil, errors.Join(errSealedInitialization, err)
+	if restoreErr := app.Restore(io.NopCloser(bytes.NewReader(body))); restoreErr != nil {
+		return nil, errors.Join(errSealedInitialization, restoreErr)
 	}
-	r, err := replaySealedHistory(ctx, app, proof, history, election.term, confirmApply)
+	r, err := replaySealedHistory(ctx, runtime, proof, history, election.term, confirmApply)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, errors.Join(errSealedInitialization, err)
 	}
-	observation := sealedObservation{
-		CommitIndex: r.CommitIndex(), AppliedIndex: r.AppliedIndex(),
-		SnapshotIndex: proof.snapshot.Index, LastLogIndex: r.LastIndex(),
-		TailTerm: proof.tailTerm, ElectionTerm: r.CurrentTerm(),
-		ConfigurationIndex: r.configurations.committedIndex, Configuration: r.configurations.committed.Clone(),
-	}
+	observation := observeSealedRuntimeV1(r, proof.tailTerm)
 	confirm := observation
 	confirm.Configuration = observation.Configuration.Clone()
 	if err := confirmState(confirm); err != nil {
@@ -126,7 +151,73 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 	if err := refenceSealedSources(ctx, proof, history, election, logs, stable, snapshots); err != nil {
 		return nil, err
 	}
-	return &sealedInitialization{raft: r, app: app, observation: observation}, nil
+	originalFSM, originalLogs, originalStable := r.fsm, r.logs, r.stable
+	originalSnapshots, originalTransport := r.snapshots, r.trans
+	originalSnapshotIndex, originalSnapshotTerm := r.getLastSnapshot()
+	originalLogIndex, originalLogTerm := r.getLastLog()
+	originalConfig := r.conf.Load()
+	originalLocalID, originalLocalAddr, originalProtocol := r.localID, r.localAddr, r.protocolVersion
+	verifyRuntime := func() bool {
+		snapshotIndex, snapshotTerm := r.getLastSnapshot()
+		logIndex, logTerm := r.getLastLog()
+		return r.State() == Follower &&
+			r.localID == originalLocalID && r.localAddr == originalLocalAddr && r.protocolVersion == originalProtocol &&
+			snapshotIndex == originalSnapshotIndex && snapshotTerm == originalSnapshotTerm &&
+			logIndex == originalLogIndex && logTerm == originalLogTerm &&
+			reflect.DeepEqual(r.conf.Load(), originalConfig) &&
+			reflect.DeepEqual(observeSealedRuntimeV1(r, proof.tailTerm), observation) &&
+			r.configurations.latestIndex == observation.ConfigurationIndex &&
+			reflect.DeepEqual(r.configurations.latest, observation.Configuration) &&
+			sameSealedInputV1(r.fsm, originalFSM) && sameSealedInputV1(r.logs, originalLogs) &&
+			sameSealedInputV1(r.stable, originalStable) && sameSealedInputV1(r.snapshots, originalSnapshots) &&
+			sameSealedInputV1(r.trans, originalTransport)
+	}
+	retained := &sealedInitialization{
+		raft: r, app: app, observation: observation, startup: ctx,
+	}
+	retained.revalidate = func() error {
+		check := ctx
+		if retained.raft != r || !sameSealedInputV1(retained.startup, ctx) || !verifyRuntime() {
+			return errSealedInitialization
+		}
+		if err := check.Err(); err != nil {
+			return errors.Join(errSealedInitialization, err)
+		}
+		if err := refenceSealedSources(check, proof, history, election, logs, stable, snapshots); err != nil {
+			return err
+		}
+		confirmed := observation
+		confirmed.Configuration = observation.Configuration.Clone()
+		if err := confirmState(confirmed); err != nil {
+			return errors.Join(errSealedInitialization, err)
+		}
+		if !verifyRuntime() {
+			return errSealedInitialization
+		}
+		return refenceSealedSources(check, proof, history, election, logs, stable, snapshots)
+	}
+	return retained, nil
+}
+
+func observeSealedRuntimeV1(runtime *Raft, tailTerm uint64) sealedObservation {
+	snapshotIndex, _ := runtime.getLastSnapshot()
+	return sealedObservation{
+		CommitIndex: runtime.CommitIndex(), AppliedIndex: runtime.AppliedIndex(),
+		SnapshotIndex: snapshotIndex, LastLogIndex: runtime.LastIndex(),
+		TailTerm: tailTerm, ElectionTerm: runtime.CurrentTerm(),
+		ConfigurationIndex: runtime.configurations.committedIndex,
+		Configuration:      runtime.configurations.committed.Clone(),
+	}
+}
+
+func sameSealedInputV1(left, right interface{}) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if !reflect.ValueOf(left).Comparable() || !reflect.ValueOf(right).Comparable() {
+		return false
+	}
+	return left == right
 }
 
 func checkSealedConfiguration(configuration Configuration) error {
@@ -252,9 +343,10 @@ func readSealedSnapshot(snapshots sealedSnapshotReader, proof sealedProof) ([]by
 	return raw, nil
 }
 
-func replaySealedHistory(ctx context.Context, app sealedApplication, proof sealedProof, history sealedHistory,
+func replaySealedHistory(ctx context.Context, r *Raft, proof sealedProof, history sealedHistory,
 	electionTerm uint64, confirmApply func(Log, interface{}) error,
 ) (*Raft, error) {
+	app := r.fsm
 	config, configIndex := proof.snapshot.Configuration, proof.snapshot.ConfigurationIndex
 	for _, entry := range history.entries[1:] {
 		if err := ctx.Err(); err != nil {
@@ -288,7 +380,6 @@ func replaySealedHistory(ctx context.Context, app sealedApplication, proof seale
 		return nil, errors.Join(errSealedInitialization, err)
 	}
 	last := history.entries[len(history.entries)-1]
-	r := &Raft{fsm: appAdapter{app}}
 	r.raftState.setState(Follower)
 	r.raftState.setCurrentTerm(electionTerm) // in-memory only
 	r.setLastSnapshot(proof.snapshot.Index, proof.snapshot.Term)
@@ -312,8 +403,8 @@ func refenceSealedSources(ctx context.Context, proof sealedProof, history sealed
 	if err != nil || !reflect.DeepEqual(history, gotHistory) {
 		return errors.Join(errSealedInitialization, err)
 	}
-	if _, err := readSealedSnapshot(snapshots, proof); err != nil {
-		return err
+	if _, snapshotErr := readSealedSnapshot(snapshots, proof); snapshotErr != nil {
+		return snapshotErr
 	}
 	gotElection, err := readSealedElection(stable)
 	if err != nil || election != gotElection || ctx.Err() != nil {
