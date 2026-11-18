@@ -240,6 +240,11 @@ type Config struct {
 	// e.g: raft_replication_heartbeat_peer0
 	NoLegacyTelemetry bool
 
+	// EnableLocalApplyFenceV1 opts into ApplyWithLocalFenceV1 and keeps all
+	// heartbeat handling on the Raft event loop. It is immutable after
+	// construction and defaults to false. It changes no wire or log format.
+	EnableLocalApplyFenceV1 bool
+
 	// skipStartup allows NewRaft() to bypass all background work goroutines
 	skipStartup bool
 }
