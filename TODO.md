@@ -2,8 +2,9 @@
 
 ## Required before adopting serving restart
 
-- Join the original configuration, stores, selected snapshot, FSM and deferred
-  transport in one private constructor with retained partial-failure cleanup.
+- Run the detached host-gate checks with Go 1.26.11, including root-module
+  normal and race tests plus vet, and the focused Go 1.20.14 compatibility
+  check for the sealed runtime constructor. This VM has Go 1.26.9 only.
 - Review a public handoff interface and its actual elasticd owner composition.
   The current private worker/delivery prototype is not authenticated physical
   publication, a dependency adoption, or a serving-readiness result.

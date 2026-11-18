@@ -30,6 +30,11 @@ type sealedRuntimeWorkersV1 struct {
 	startup     context.Context
 	revalidate  func() error
 	transport   *sealedTransportGateV1
+	logs        LogStore
+	stable      StableStore
+	snapshots   SnapshotStore
+	app         FSM
+	source      Transport
 	mu          sync.Mutex
 	phase       sealedWorkerPhaseV1
 	start       chan struct{}
@@ -45,8 +50,30 @@ type sealedRuntimeWorkersV1 struct {
 // parks their real bodies behind one owned gate. It cannot park the old sparse
 // readback-only object, borrow a different transport, or claim a node twice.
 func parkSealedRuntimeWorkersV1(local *sealedInitialization, transport *sealedTransportGateV1) (*sealedRuntimeWorkersV1, error) {
+	owner := newSealedRuntimeWorkerOwnerV1(transport)
+	return parkSealedRuntimeWorkersIntoV1(owner, local, transport)
+}
+
+// newSealedRuntimeWorkerOwnerV1 allocates retained cleanup custody as soon as
+// its original transport gate has been acquired. Callers fill the original
+// inputs before construction can fail at a later stage.
+func newSealedRuntimeWorkerOwnerV1(
+	transport *sealedTransportGateV1,
+) *sealedRuntimeWorkersV1 {
+	return &sealedRuntimeWorkersV1{
+		transport: transport,
+		phase:     sealedWorkersHeldV1,
+		start:     make(chan struct{}),
+		closeDone: make(chan struct{}),
+	}
+}
+
+func parkSealedRuntimeWorkersIntoV1(owner *sealedRuntimeWorkersV1,
+	local *sealedInitialization, transport *sealedTransportGateV1,
+) (*sealedRuntimeWorkersV1, error) {
 	if local == nil || local.raft == nil || local.startup == nil || local.revalidate == nil ||
-		transport == nil || !transport.ownsV1(local.raft.trans) || !transport.heldV1() {
+		owner == nil || transport == nil || owner.transport != transport ||
+		!transport.ownsV1(local.raft.trans) || !transport.heldV1() {
 		return nil, errSealedRuntimeWorkersV1
 	}
 	runtime := local.raft
@@ -62,11 +89,8 @@ func parkSealedRuntimeWorkersV1(local *sealedInitialization, transport *sealedTr
 	}
 	local.workerClaim = true
 	local.workerMu.Unlock()
-	owner := &sealedRuntimeWorkersV1{
-		local: local, runtime: runtime, startup: local.startup, revalidate: local.revalidate,
-		transport: transport, phase: sealedWorkersHeldV1,
-		start: make(chan struct{}), closeDone: make(chan struct{}),
-	}
+	owner.local, owner.runtime = local, runtime
+	owner.startup, owner.revalidate = local.startup, local.revalidate
 	if _, bounded := local.startup.Deadline(); !bounded {
 		owner.beginCloseV1()
 		return owner, errSealedRuntimeWorkersV1
@@ -180,13 +204,24 @@ func (owner *sealedRuntimeWorkersV1) beginCloseV1() {
 		owner.stopStartupV1()
 		// Stop real worker admission immediately, even if physical close blocks.
 		// Physical closure still precedes waiting for the resulting join.
-		shutdown := owner.runtime.Shutdown()
 		go func() {
-			transportErr := owner.transport.Close()
-			workerErr := shutdown.Error()
+			var shutdown Future
+			if owner.runtime != nil {
+				shutdown = owner.runtime.Shutdown()
+			}
+			var transportErr error
+			if owner.transport != nil {
+				transportErr = owner.transport.Close()
+			}
+			var workerErr error
+			if shutdown != nil {
+				workerErr = shutdown.Error()
+			}
 			// A second Shutdown future is already complete and does not join.
 			// Always join the originally registered workers themselves too.
-			owner.runtime.waitShutdown()
+			if owner.runtime != nil {
+				owner.runtime.waitShutdown()
+			}
 			if owner.startupDone != nil {
 				<-owner.startupDone
 			}
