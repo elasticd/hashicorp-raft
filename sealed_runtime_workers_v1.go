@@ -1,0 +1,223 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
+package raft
+
+import (
+	"context"
+	"errors"
+	"sync"
+)
+
+var errSealedRuntimeWorkersV1 = errors.New("sealed runtime worker transition refused")
+
+type sealedWorkerPhaseV1 uint8
+
+const (
+	sealedWorkersHeldV1 sealedWorkerPhaseV1 = iota
+	sealedWorkersReleasingV1
+	sealedWorkersReleasedV1
+	sealedWorkersClosingV1
+	sealedWorkersClosedV1
+)
+
+// sealedRuntimeWorkersV1 owns one private worker attempt. Its release is only
+// a library transition: a production caller must also retain and validate the
+// actual authenticated physical-publication owner before invoking it.
+type sealedRuntimeWorkersV1 struct {
+	local       *sealedInitialization
+	runtime     *Raft
+	startup     context.Context
+	revalidate  func() error
+	transport   *sealedTransportGateV1
+	mu          sync.Mutex
+	phase       sealedWorkerPhaseV1
+	start       chan struct{}
+	startupStop chan struct{}
+	startupDone chan struct{}
+	stopOnce    sync.Once
+	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
+}
+
+// parkSealedRuntimeWorkersV1 registers exactly the ordinary three workers but
+// parks their real bodies behind one owned gate. It cannot park the old sparse
+// readback-only object, borrow a different transport, or claim a node twice.
+func parkSealedRuntimeWorkersV1(local *sealedInitialization, transport *sealedTransportGateV1) (*sealedRuntimeWorkersV1, error) {
+	if local == nil || local.raft == nil || local.startup == nil || local.revalidate == nil ||
+		transport == nil || !transport.ownsV1(local.raft.trans) || !transport.heldV1() {
+		return nil, errSealedRuntimeWorkersV1
+	}
+	runtime := local.raft
+	if runtime.shutdownCh == nil || runtime.applyCh == nil || runtime.fsmMutateCh == nil ||
+		runtime.fsmSnapshotCh == nil || runtime.rpcCh == nil || runtime.logs == nil ||
+		runtime.stable == nil || runtime.snapshots == nil {
+		return nil, errSealedRuntimeWorkersV1
+	}
+	local.workerMu.Lock()
+	if local.workerClaim {
+		local.workerMu.Unlock()
+		return nil, errSealedRuntimeWorkersV1
+	}
+	local.workerClaim = true
+	local.workerMu.Unlock()
+	owner := &sealedRuntimeWorkersV1{
+		local: local, runtime: runtime, startup: local.startup, revalidate: local.revalidate,
+		transport: transport, phase: sealedWorkersHeldV1,
+		start: make(chan struct{}), closeDone: make(chan struct{}),
+	}
+	if _, bounded := local.startup.Deadline(); !bounded {
+		owner.beginCloseV1()
+		return owner, errSealedRuntimeWorkersV1
+	}
+	if err := owner.revalidate(); err != nil {
+		owner.beginCloseV1()
+		return owner, errors.Join(errSealedRuntimeWorkersV1, err)
+	}
+	for _, body := range []func(){runtime.run, runtime.runFSM, runtime.runSnapshots} {
+		workerBody := body
+		runtime.goFunc(func() {
+			select {
+			case <-runtime.shutdownCh:
+				return
+			case <-owner.start:
+				workerBody()
+			}
+		})
+	}
+	// Register cancellation only after all wait-group additions. After the
+	// successful handoff it must not silently stop the serving lifetime.
+	owner.startupStop = make(chan struct{})
+	owner.startupDone = make(chan struct{})
+	go func() {
+		defer close(owner.startupDone)
+		select {
+		case <-owner.startupStop:
+			return
+		case <-owner.startup.Done():
+			owner.mu.Lock()
+			if owner.phase == sealedWorkersReleasedV1 || owner.phase >= sealedWorkersClosingV1 {
+				owner.mu.Unlock()
+				return
+			}
+			owner.phase = sealedWorkersClosingV1
+			owner.mu.Unlock()
+			owner.beginCloseV1()
+		}
+	}()
+	if err := owner.startup.Err(); err != nil {
+		owner.beginCloseV1()
+		return owner, errors.Join(errSealedRuntimeWorkersV1, err)
+	}
+	return owner, nil
+}
+
+// releaseV1 consumes the original attempt before proof validation. No new
+// checkpoint, verifier, store, FSM or deadline can be supplied at release.
+func (owner *sealedRuntimeWorkersV1) releaseV1() (*Raft, error) {
+	if owner == nil {
+		return nil, errSealedRuntimeWorkersV1
+	}
+	owner.mu.Lock()
+	if owner.phase != sealedWorkersHeldV1 {
+		owner.mu.Unlock()
+		return nil, errSealedRuntimeWorkersV1
+	}
+	owner.phase = sealedWorkersReleasingV1
+	owner.mu.Unlock()
+	if err := owner.revalidate(); err != nil {
+		owner.beginCloseV1()
+		return nil, errors.Join(errSealedRuntimeWorkersV1, err)
+	}
+	owner.mu.Lock()
+	if owner.phase != sealedWorkersReleasingV1 || owner.startup.Err() != nil || owner.local.raft != owner.runtime {
+		owner.mu.Unlock()
+		owner.beginCloseV1()
+		return nil, errSealedRuntimeWorkersV1
+	}
+	if err := owner.transport.releaseV1(); err != nil {
+		owner.mu.Unlock()
+		owner.beginCloseV1()
+		return nil, errors.Join(errSealedRuntimeWorkersV1, err)
+	}
+	close(owner.start)
+	if err := owner.startup.Err(); err != nil {
+		owner.phase = sealedWorkersClosingV1
+		owner.mu.Unlock()
+		owner.beginCloseV1()
+		// A worker may already have run; this is retained cleanup custody,
+		// never a claim that the attempt performed no writes.
+		return nil, errors.Join(errSealedRuntimeWorkersV1, err)
+	}
+	owner.phase = sealedWorkersReleasedV1
+	owner.stopStartupV1()
+	owner.mu.Unlock()
+	select {
+	case <-owner.startupDone:
+		if err := owner.startup.Err(); err != nil {
+			owner.beginCloseV1()
+			return nil, errors.Join(errSealedRuntimeWorkersV1, err)
+		}
+	case <-owner.startup.Done():
+		owner.beginCloseV1()
+		return nil, errors.Join(errSealedRuntimeWorkersV1, owner.startup.Err())
+	}
+	return owner.runtime, nil
+}
+
+func (owner *sealedRuntimeWorkersV1) stopStartupV1() {
+	if owner.startupStop != nil {
+		owner.stopOnce.Do(func() { close(owner.startupStop) })
+	}
+}
+
+func (owner *sealedRuntimeWorkersV1) beginCloseV1() {
+	owner.closeOnce.Do(func() {
+		owner.mu.Lock()
+		owner.phase = sealedWorkersClosingV1
+		owner.mu.Unlock()
+		owner.stopStartupV1()
+		// Stop real worker admission immediately, even if physical close blocks.
+		// Physical closure still precedes waiting for the resulting join.
+		shutdown := owner.runtime.Shutdown()
+		go func() {
+			transportErr := owner.transport.Close()
+			workerErr := shutdown.Error()
+			// A second Shutdown future is already complete and does not join.
+			// Always join the originally registered workers themselves too.
+			owner.runtime.waitShutdown()
+			if owner.startupDone != nil {
+				<-owner.startupDone
+			}
+			owner.mu.Lock()
+			owner.closeErr = errors.Join(transportErr, workerErr)
+			owner.phase = sealedWorkersClosedV1
+			owner.mu.Unlock()
+			close(owner.closeDone)
+		}()
+	})
+}
+
+// closeV1 joins this same cleanup attempt under a bounded waiting context.
+// Timeout or a physical close error retains the owner and forbids reuse.
+func (owner *sealedRuntimeWorkersV1) closeV1(ctx context.Context) error {
+	if owner == nil || ctx == nil {
+		return errSealedRuntimeWorkersV1
+	}
+	if _, bounded := ctx.Deadline(); !bounded {
+		return errSealedRuntimeWorkersV1
+	}
+	owner.beginCloseV1()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-owner.closeDone:
+		owner.mu.Lock()
+		defer owner.mu.Unlock()
+		return owner.closeErr
+	}
+}

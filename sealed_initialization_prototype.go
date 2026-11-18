@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sync"
 )
 
 // The initialization kernel receives no start capability, transport,
@@ -66,6 +67,10 @@ type sealedInitialization struct {
 	raft        *Raft
 	app         sealedApplication
 	observation sealedObservation
+	startup     context.Context
+	revalidate  func() error
+	workerMu    sync.Mutex
+	workerClaim bool
 }
 
 func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLogReader,
@@ -82,6 +87,10 @@ func initializeSealedRaft(ctx context.Context, proof sealedProof, logs sealedLog
 	}
 	// Keep the original V1 application's retained identity, not its adapter.
 	sealed.app = app
+	// The legacy readback-only result must not retain a startup capability or
+	// extend custody of the captured history through a new revalidation closure.
+	sealed.startup = nil
+	sealed.revalidate = nil
 	return sealed, nil
 }
 
@@ -133,12 +142,7 @@ func initializeSealedRaftIntoV1(ctx context.Context, runtime *Raft, proof sealed
 	if err := ctx.Err(); err != nil {
 		return nil, errors.Join(errSealedInitialization, err)
 	}
-	observation := sealedObservation{
-		CommitIndex: r.CommitIndex(), AppliedIndex: r.AppliedIndex(),
-		SnapshotIndex: proof.snapshot.Index, LastLogIndex: r.LastIndex(),
-		TailTerm: proof.tailTerm, ElectionTerm: r.CurrentTerm(),
-		ConfigurationIndex: r.configurations.committedIndex, Configuration: r.configurations.committed.Clone(),
-	}
+	observation := observeSealedRuntimeV1(r, proof.tailTerm)
 	confirm := observation
 	confirm.Configuration = observation.Configuration.Clone()
 	if err := confirmState(confirm); err != nil {
@@ -147,7 +151,73 @@ func initializeSealedRaftIntoV1(ctx context.Context, runtime *Raft, proof sealed
 	if err := refenceSealedSources(ctx, proof, history, election, logs, stable, snapshots); err != nil {
 		return nil, err
 	}
-	return &sealedInitialization{raft: r, app: app, observation: observation}, nil
+	originalFSM, originalLogs, originalStable := r.fsm, r.logs, r.stable
+	originalSnapshots, originalTransport := r.snapshots, r.trans
+	originalSnapshotIndex, originalSnapshotTerm := r.getLastSnapshot()
+	originalLogIndex, originalLogTerm := r.getLastLog()
+	originalConfig := r.conf.Load()
+	originalLocalID, originalLocalAddr, originalProtocol := r.localID, r.localAddr, r.protocolVersion
+	verifyRuntime := func() bool {
+		snapshotIndex, snapshotTerm := r.getLastSnapshot()
+		logIndex, logTerm := r.getLastLog()
+		return r.State() == Follower &&
+			r.localID == originalLocalID && r.localAddr == originalLocalAddr && r.protocolVersion == originalProtocol &&
+			snapshotIndex == originalSnapshotIndex && snapshotTerm == originalSnapshotTerm &&
+			logIndex == originalLogIndex && logTerm == originalLogTerm &&
+			reflect.DeepEqual(r.conf.Load(), originalConfig) &&
+			reflect.DeepEqual(observeSealedRuntimeV1(r, proof.tailTerm), observation) &&
+			r.configurations.latestIndex == observation.ConfigurationIndex &&
+			reflect.DeepEqual(r.configurations.latest, observation.Configuration) &&
+			sameSealedInputV1(r.fsm, originalFSM) && sameSealedInputV1(r.logs, originalLogs) &&
+			sameSealedInputV1(r.stable, originalStable) && sameSealedInputV1(r.snapshots, originalSnapshots) &&
+			sameSealedInputV1(r.trans, originalTransport)
+	}
+	retained := &sealedInitialization{
+		raft: r, app: app, observation: observation, startup: ctx,
+	}
+	retained.revalidate = func() error {
+		check := ctx
+		if retained.raft != r || !sameSealedInputV1(retained.startup, ctx) || !verifyRuntime() {
+			return errSealedInitialization
+		}
+		if err := check.Err(); err != nil {
+			return errors.Join(errSealedInitialization, err)
+		}
+		if err := refenceSealedSources(check, proof, history, election, logs, stable, snapshots); err != nil {
+			return err
+		}
+		confirmed := observation
+		confirmed.Configuration = observation.Configuration.Clone()
+		if err := confirmState(confirmed); err != nil {
+			return errors.Join(errSealedInitialization, err)
+		}
+		if !verifyRuntime() {
+			return errSealedInitialization
+		}
+		return refenceSealedSources(check, proof, history, election, logs, stable, snapshots)
+	}
+	return retained, nil
+}
+
+func observeSealedRuntimeV1(runtime *Raft, tailTerm uint64) sealedObservation {
+	snapshotIndex, _ := runtime.getLastSnapshot()
+	return sealedObservation{
+		CommitIndex: runtime.CommitIndex(), AppliedIndex: runtime.AppliedIndex(),
+		SnapshotIndex: snapshotIndex, LastLogIndex: runtime.LastIndex(),
+		TailTerm: tailTerm, ElectionTerm: runtime.CurrentTerm(),
+		ConfigurationIndex: runtime.configurations.committedIndex,
+		Configuration:      runtime.configurations.committed.Clone(),
+	}
+}
+
+func sameSealedInputV1(left, right interface{}) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if !reflect.ValueOf(left).Comparable() || !reflect.ValueOf(right).Comparable() {
+		return false
+	}
+	return left == right
 }
 
 func checkSealedConfiguration(configuration Configuration) error {
