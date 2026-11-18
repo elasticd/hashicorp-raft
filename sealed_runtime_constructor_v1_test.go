@@ -12,12 +12,13 @@ import (
 
 type sealedRuntimeConstructorApplicationV1 struct {
 	*runtimeAssemblySealedApplicationV1
+	snapshotErr error
 }
 
 func (app *sealedRuntimeConstructorApplicationV1) Snapshot() (
 	FSMSnapshot, error,
 ) {
-	return nil, errSealedInitialization
+	return nil, app.snapshotErr
 }
 
 func newSealedRuntimeConstructorInputsV1(t *testing.T) (
@@ -40,6 +41,7 @@ func newSealedRuntimeConstructorInputsV1(t *testing.T) (
 	}
 	app := &sealedRuntimeConstructorApplicationV1{
 		runtimeAssemblySealedApplicationV1: sealedApp,
+		snapshotErr:                        errors.New("outer snapshot guard"),
 	}
 	conf := DefaultConfig()
 	conf.LocalID = "a"
@@ -71,6 +73,12 @@ func TestNewSealedRuntimeWorkersV1ParksSameRuntime(t *testing.T) {
 		owner.app != app {
 		t.Fatalf("constructor did not retain original owner: %p %v", owner,
 			err)
+	}
+	if owner.runtime.fsm != app {
+		t.Fatalf("constructor replaced guarded FSM: got %T", owner.runtime.fsm)
+	}
+	if _, err := owner.runtime.fsm.Snapshot(); err != app.snapshotErr {
+		t.Fatalf("runtime lost guarded Snapshot result: %v", err)
 	}
 	if owner.phase != sealedWorkersHeldV1 || app.restores.Load() != 1 ||
 		app.applies.Load() != 1 || source.outboundCalls.Load() != 0 ||

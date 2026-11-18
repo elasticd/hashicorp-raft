@@ -25,25 +25,26 @@ const (
 // a library transition: a production caller must also retain and validate the
 // actual authenticated physical-publication owner before invoking it.
 type sealedRuntimeWorkersV1 struct {
-	local       *sealedInitialization
-	runtime     *Raft
-	startup     context.Context
-	revalidate  func() error
-	transport   *sealedTransportGateV1
-	logs        LogStore
-	stable      StableStore
-	snapshots   SnapshotStore
-	app         FSM
-	source      Transport
-	mu          sync.Mutex
-	phase       sealedWorkerPhaseV1
-	start       chan struct{}
-	startupStop chan struct{}
-	startupDone chan struct{}
-	stopOnce    sync.Once
-	closeOnce   sync.Once
-	closeDone   chan struct{}
-	closeErr    error
+	local         *sealedInitialization
+	runtime       *Raft
+	startup       context.Context
+	revalidate    func() error
+	transport     *sealedTransportGateV1
+	logs          LogStore
+	stable        StableStore
+	snapshots     SnapshotStore
+	app           FSM
+	source        Transport
+	mu            sync.Mutex
+	phase         sealedWorkerPhaseV1
+	start         chan struct{}
+	startupStop   chan struct{}
+	startupDone   chan struct{}
+	gateWatchDone chan struct{}
+	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeDone     chan struct{}
+	closeErr      error
 }
 
 // parkSealedRuntimeWorkersV1 registers exactly the ordinary three workers but
@@ -110,6 +111,22 @@ func parkSealedRuntimeWorkersIntoV1(owner *sealedRuntimeWorkersV1,
 			}
 		})
 	}
+	// This watcher is registered only after every ordinary runtime worker has
+	// joined its wait group. A poisoned local gate owns the same runtime
+	// lifetime whether it is observed before or after release.
+	owner.mu.Lock()
+	owner.gateWatchDone = make(chan struct{})
+	gateWatchDone := owner.gateWatchDone
+	owner.mu.Unlock()
+	go func() {
+		defer close(gateWatchDone)
+		<-owner.transport.stop
+		if owner.transport.failedV1() {
+			// Do not self-join: the cleanup goroutine joins this watcher after
+			// this asynchronous close initiation has returned.
+			go owner.beginCloseV1()
+		}
+	}()
 	// Register cancellation only after all wait-group additions. After the
 	// successful handoff it must not silently stop the serving lifetime.
 	owner.startupStop = make(chan struct{})
@@ -202,13 +219,15 @@ func (owner *sealedRuntimeWorkersV1) beginCloseV1() {
 		owner.phase = sealedWorkersClosingV1
 		owner.mu.Unlock()
 		owner.stopStartupV1()
+		var shutdown Future
+		if owner.runtime != nil {
+			// Signal shutdown synchronously. It is safe at every construction
+			// stage and must not wait for a blocking physical close.
+			shutdown = owner.runtime.Shutdown()
+		}
 		// Stop real worker admission immediately, even if physical close blocks.
 		// Physical closure still precedes waiting for the resulting join.
 		go func() {
-			var shutdown Future
-			if owner.runtime != nil {
-				shutdown = owner.runtime.Shutdown()
-			}
 			var transportErr error
 			if owner.transport != nil {
 				transportErr = owner.transport.Close()
@@ -224,6 +243,12 @@ func (owner *sealedRuntimeWorkersV1) beginCloseV1() {
 			}
 			if owner.startupDone != nil {
 				<-owner.startupDone
+			}
+			owner.mu.Lock()
+			gateWatchDone := owner.gateWatchDone
+			owner.mu.Unlock()
+			if gateWatchDone != nil {
+				<-gateWatchDone
 			}
 			owner.mu.Lock()
 			owner.closeErr = errors.Join(transportErr, workerErr)

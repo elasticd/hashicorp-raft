@@ -447,3 +447,81 @@ func TestSealedRuntimeWorkersV1ShutdownAndJoinDoNotWaitForPhysicalClose(t *testi
 		t.Fatalf("completed cleanup resurrected: %p %v", runtime, err)
 	}
 }
+
+func TestSealedRuntimeWorkersV1BeginCloseSignalsBeforePhysicalClose(t *testing.T) {
+	fixture := newSealedWorkersFixtureV1(t)
+	physicalProceed := make(chan struct{})
+	fixture.source.closeEntered = make(chan struct{}, 1)
+	fixture.source.closeProceed = physicalProceed
+	var proceedOnce sync.Once
+	t.Cleanup(func() { proceedOnce.Do(func() { close(physicalProceed) }) })
+	owner := fixture.park(t)
+	owner.beginCloseV1()
+	select {
+	case <-fixture.runtime.shutdownCh:
+	default:
+		t.Fatal("beginClose returned before signalling runtime shutdown")
+	}
+	select {
+	case <-fixture.source.closeEntered:
+		t.Fatal("beginClose waited for physical Close")
+	default:
+	}
+	proceedOnce.Do(func() { close(physicalProceed) })
+	if err := sealedWorkersCloseV1(t, owner); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSealedRuntimeWorkersV1GateConsumerPoisonClosesSameRuntime(t *testing.T) {
+	fixture := newSealedWorkersFixtureV1(t)
+	owner := fixture.park(t)
+	// Holding the gate has not consumed this source channel. Its closure only
+	// becomes observable after release opens the pump.
+	close(fixture.source.InmemTransport.consumerCh)
+	if runtime, err := owner.releaseV1(); err != nil && runtime != nil {
+		t.Fatalf("release returned runtime with error: %p %v", runtime, err)
+	}
+	select {
+	case <-owner.closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("consumer poison did not join the owned runtime")
+	}
+	if fixture.runtime.State() != Shutdown || fixture.source.closes.Load() != 1 {
+		t.Fatalf("poison retained runtime=%v closes=%d", fixture.runtime.State(), fixture.source.closes.Load())
+	}
+	if err := sealedWorkersCloseV1(t, owner); !errors.Is(err, errSealedTransportGateV1) {
+		t.Fatalf("consumer poison lost sticky gate error: %v", err)
+	}
+	if runtime, err := owner.releaseV1(); runtime != nil || !errors.Is(err, errSealedRuntimeWorkersV1) {
+		t.Fatalf("poisoned owner reopened: %p %v", runtime, err)
+	}
+}
+
+func TestSealedRuntimeWorkersV1PipelinePoisonClosesSameRuntime(t *testing.T) {
+	fixture := newSealedWorkersFixtureV1(t)
+	owner := fixture.park(t)
+	if runtime, err := owner.releaseV1(); err != nil || runtime != fixture.runtime {
+		t.Fatalf("release: %p %v", runtime, err)
+	}
+	pipelineErr := errors.New("pipeline cleanup poison")
+	pipeline := &sealedAppendPipelineV1{
+		gate:   owner.transport,
+		source: &sealedGatePipelineSpyV1{closeErr: pipelineErr},
+	}
+	if err := pipeline.Close(); err != pipelineErr {
+		t.Fatalf("pipeline cleanup: %v", err)
+	}
+	select {
+	case <-owner.closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("pipeline poison did not join the owned runtime")
+	}
+	if fixture.runtime.State() != Shutdown || fixture.source.closes.Load() != 1 {
+		t.Fatalf("poison retained runtime=%v closes=%d", fixture.runtime.State(), fixture.source.closes.Load())
+	}
+	if err := sealedWorkersCloseV1(t, owner); !errors.Is(err, pipelineErr) ||
+		!errors.Is(err, errSealedTransportGateV1) {
+		t.Fatalf("pipeline poison lost sticky cleanup errors: %v", err)
+	}
+}

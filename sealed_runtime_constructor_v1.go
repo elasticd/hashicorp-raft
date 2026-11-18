@@ -66,7 +66,7 @@ func newSealedRuntimeWorkersV1(
 	}
 
 	runtime, err := newRaftRuntimeV1(
-		&copiedConf, appAdapter{app}, logs, stable, snapshots, transport,
+		&copiedConf, app, logs, stable, snapshots, transport,
 	)
 	if err != nil {
 		return fail(err)

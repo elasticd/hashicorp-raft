@@ -188,6 +188,17 @@ func (gate *sealedTransportGateV1) failV1() {
 	gate.stopOnce.Do(func() { close(gate.stop) })
 }
 
+// failedV1 reports only a local gate poison. Ordinary remote RPC errors are
+// returned to their callers and never change this state.
+func (gate *sealedTransportGateV1) failedV1() bool {
+	if gate == nil {
+		return false
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.failure != nil
+}
+
 func (gate *sealedTransportGateV1) beginV1() bool {
 	if gate == nil {
 		return false
